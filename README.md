@@ -5,6 +5,7 @@
 [![Website](https://img.shields.io/badge/website-glyph.boottify.com-%23d2f800?style=flat-square)](https://glyph.boottify.com)
 [![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue?style=flat-square)](https://www.python.org/)
+[![Tools](https://img.shields.io/badge/Boottify-Tools-%23d2f800?style=flat-square)](https://boottify.com/tools)
 
 Glyph is a **lightning-fast, zero-LLM-cost codebase indexer** that builds a knowledge graph of your source code using tree-sitter AST parsing. It answers the questions that slow you down: *Where is X defined? What calls this? What are the most-connected symbols? Show me the call chain from A to B.*
 
