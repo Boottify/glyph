@@ -17,7 +17,7 @@ from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 from tree_sitter import Language, Parser, Node
 
@@ -144,6 +144,54 @@ def init_schema():
     CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(source_id);
     CREATE INDEX IF NOT EXISTS idx_edges_tgt ON edges(target_id);
     CREATE INDEX IF NOT EXISTS idx_files_project ON files(project_id);
+
+    -- v1.2: File-level metrics (collected during scan)
+    CREATE TABLE IF NOT EXISTS file_metrics (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        file_id INTEGER NOT NULL,
+        project_id INTEGER NOT NULL,
+        line_count INTEGER DEFAULT 0,
+        symbol_count INTEGER DEFAULT 0,
+        max_nesting_depth INTEGER DEFAULT 0,
+        fallow_last_health INTEGER DEFAULT 0,
+        fallow_last_dead_code INTEGER DEFAULT 0,
+        fallow_last_dupes INTEGER DEFAULT 0,
+        FOREIGN KEY (file_id) REFERENCES files(id),
+        FOREIGN KEY (project_id) REFERENCES projects(id),
+        UNIQUE(file_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_file_metrics_project
+        ON file_metrics(project_id);
+
+    -- v1.2: Fallow analysis issues (ingested from fallow JSON)
+    CREATE TABLE IF NOT EXISTS fallow_issues (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id INTEGER NOT NULL,
+        file_id INTEGER,
+        symbol_name TEXT,
+        issue_kind TEXT NOT NULL,
+        sub_kind TEXT,
+        severity TEXT,
+        line INTEGER DEFAULT 0,
+        col INTEGER DEFAULT 0,
+        cyclomatic INTEGER,
+        cognitive INTEGER,
+        line_count INTEGER,
+        param_count INTEGER,
+        crap_score REAL,
+        message TEXT,
+        actions_json TEXT,
+        ingested_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+        scan_version TEXT,
+        FOREIGN KEY (project_id) REFERENCES projects(id),
+        FOREIGN KEY (file_id) REFERENCES files(id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_fallow_issues_project
+        ON fallow_issues(project_id, issue_kind);
+    CREATE INDEX IF NOT EXISTS idx_fallow_issues_file
+        ON fallow_issues(file_id);
+    CREATE INDEX IF NOT EXISTS idx_fallow_issues_symbol
+        ON fallow_issues(symbol_name);
 
     -- v1.1: Knowledge graph extensions
     CREATE TABLE IF NOT EXISTS file_history (
@@ -602,6 +650,8 @@ def scan_project(name: str, root: str, full: bool = False):
         except Exception:
             continue
 
+        line_cnt = len(source.splitlines())
+
         # Upsert file record
         cur.execute("""INSERT INTO files (project_id, path, hash, last_parsed)
                        VALUES (?, ?, ?, ?)
@@ -620,6 +670,9 @@ def scan_project(name: str, root: str, full: bool = False):
             (SELECT id FROM symbols WHERE file_id=?)""", (file_id,))
         cur.execute("DELETE FROM symbols WHERE file_id=?", (file_id,))
 
+        # Track per-file symbol count
+        syms_before = len(all_symbols)
+
         # Parse
         if lang_name in ("typescript", "tsx", "javascript", "jsx"):
             parse_ts(file_id, project_id, source, lang_name, all_symbols, all_edges)
@@ -629,6 +682,15 @@ def scan_project(name: str, root: str, full: bool = False):
             parse_go(file_id, project_id, source, all_symbols, all_edges)
         elif lang_name == "bash":
             parse_bash(file_id, project_id, source, all_symbols, all_edges)
+
+        syms_in_file = len(all_symbols) - syms_before
+
+        # Upsert file_metrics
+        cur.execute("""INSERT INTO file_metrics (file_id, project_id, line_count, symbol_count)
+                       VALUES (?, ?, ?, ?)
+                       ON CONFLICT(file_id) DO UPDATE SET
+                       line_count=excluded.line_count, symbol_count=excluded.symbol_count""",
+                   (file_id, project_id, line_cnt, syms_in_file))
 
         parsed_count += 1
         if parsed_count % 200 == 0:
@@ -1286,6 +1348,511 @@ def stats_extended(project: str = None):
     db.close()
 
 
+# ═══════════════════════════════════════════════════════════════════
+# v1.2 — FALLOW INTEGRATION
+# ═══════════════════════════════════════════════════════════════════
+
+def fallow_ingest(project: str, kinds: str = "all"):
+    """Run Fallow on a project and ingest its JSON output.
+
+    Args:
+        project: Project name (must already be indexed via glyph scan)
+        kinds: comma-separated list of fallow analyses to run
+               (dead-code, health, dupes) or 'all' for all three
+    """
+    init_schema()
+    db = get_db()
+    cur = db.cursor()
+
+    cur.execute("SELECT id, path FROM projects WHERE name = ?", (project,))
+    row = cur.fetchone()
+    if not row:
+        print(f"Project '{project}' not indexed. Run 'glyph scan {project} <path>' first.")
+        db.close()
+        return
+    proj_id, proj_path = row
+
+    if kinds == "all":
+        analyses = ["dead-code", "health", "dupes"]
+    else:
+        analyses = [k.strip() for k in kinds.split(",") if k.strip()]
+
+    # Build file path → id lookup
+    cur.execute("SELECT id, path FROM files WHERE project_id = ?", (proj_id,))
+    path_to_id = {r[1]: r[0] for r in cur.fetchall()}
+
+    total_ingested = 0
+    for analysis in analyses:
+        print(f"[glyph] Running fallow {analysis} on {project}...")
+        try:
+            result = subprocess.run(
+                ["npx", "fallow", analysis,
+                 "--root", proj_path, "--format", "json", "--quiet"],
+                capture_output=True, text=True, timeout=300
+            )
+        except subprocess.TimeoutExpired:
+            print(f"  ⚠ fallow {analysis} timed out after 5 minutes — skipping")
+            continue
+        except FileNotFoundError:
+            print("  ⚠ fallow not found — install with: npm install -g fallow")
+            db.close()
+            return
+
+        # npx may return non-zero with npm warnings but still produce valid JSON
+        if not result.stdout.strip():
+            print(f"  ⚠ fallow {analysis} produced no output: {result.stderr[:200]}")
+            continue
+
+        try:
+            data = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            print(f"  ⚠ Could not parse fallow {analysis} JSON output")
+            continue
+
+        # Clear previous results for this analysis kind
+        cur.execute(
+            "DELETE FROM fallow_issues WHERE project_id = ? AND issue_kind = ?",
+            (proj_id, analysis)
+        )
+
+        version = data.get("version", "unknown")
+        now = int(time.time())
+        ingested = 0
+        issues = []
+
+        if analysis == "dead-code":
+            ingested += _ingest_dead_code(data, proj_id, path_to_id, now, version, issues)
+        elif analysis == "health":
+            ingested += _ingest_health(data, proj_id, path_to_id, now, version, issues)
+        elif analysis == "dupes":
+            ingested += _ingest_dupes(data, proj_id, path_to_id, now, version, issues)
+
+        if issues:
+            cur.executemany(
+                """INSERT INTO fallow_issues
+                   (project_id, file_id, symbol_name, issue_kind, sub_kind,
+                    severity, line, col, cyclomatic, cognitive, line_count,
+                    param_count, crap_score, message, actions_json,
+                    ingested_at, scan_version)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                issues
+            )
+
+        # Update file_metrics timestamp
+        col_name = "fallow_last_" + analysis.replace("-", "_")
+        cur.execute(
+            f"UPDATE file_metrics SET {col_name} = ? WHERE project_id = ? AND file_id IN "
+            f"(SELECT file_id FROM fallow_issues WHERE project_id = ? AND issue_kind = ?)",
+            (now, proj_id, proj_id, analysis)
+        )
+
+        total_ingested += ingested
+        print(f"  {analysis}: {ingested} issues ingested (fallow v{version})")
+
+    db.commit()
+    print(f"\n[glyph] Total: {total_ingested} Fallow issues stored in glyph.db")
+    db.close()
+
+
+def _ingest_dead_code(data: dict, proj_id: int, path_to_id: dict,
+                       now: int, version: str, issues: list) -> int:
+    """Ingest fallow dead-code JSON into the issues list. Returns count."""
+    count = 0
+    summary = data.get("summary", {})
+
+    # Unused files
+    for entry in data.get("unused_files", []):
+        path = entry.get("path", "")
+        fid = path_to_id.get(path)
+        actions = json.dumps(entry.get("actions", []))
+        issues.append((
+            proj_id, fid, None, "dead-code", "unused_file",
+            "warning", 0, 0, None, None, None, None, None,
+            f"Unused file: {path}", actions, now, version
+        ))
+        count += 1
+
+    # Unused exports
+    for entry in data.get("unused_exports", []):
+        path = entry.get("path", "")
+        fid = path_to_id.get(path)
+        name = entry.get("name", "?")
+        line = entry.get("line", 0)
+        col = entry.get("col", 0)
+        actions = json.dumps(entry.get("actions", []))
+        issues.append((
+            proj_id, fid, name, "dead-code", "unused_export",
+            "warning", line, col, None, None, None, None, None,
+            f"Unused export '{name}' in {path}", actions, now, version
+        ))
+        count += 1
+
+    # Unused types
+    for entry in data.get("unused_types", []):
+        path = entry.get("path", "")
+        fid = path_to_id.get(path)
+        name = entry.get("name", "?")
+        line = entry.get("line", 0)
+        actions = json.dumps(entry.get("actions", []))
+        issues.append((
+            proj_id, fid, name, "dead-code", "unused_type",
+            "warning", line, 0, None, None, None, None, None,
+            f"Unused type '{name}' in {path}", actions, now, version
+        ))
+        count += 1
+
+    # Unused dependencies
+    for entry in data.get("unused_dependencies", []):
+        name = entry.get("name", "?")
+        issues.append((
+            proj_id, None, name, "dead-code", "unused_dependency",
+            "info", 0, 0, None, None, None, None, None,
+            f"Unused dependency: {name}", "[]", now, version
+        ))
+        count += 1
+
+    # Circular dependencies
+    for entry in data.get("circular_dependencies", []):
+        paths = entry.get("paths", [])
+        msg = " → ".join(paths) if paths else "circular dependency"
+        issues.append((
+            proj_id, None, None, "dead-code", "circular_dep",
+            "error", 0, 0, None, None, None, None, None,
+            msg, "[]", now, version
+        ))
+        count += 1
+
+    # Boundary violations
+    for entry in data.get("boundary_violations", []):
+        path = entry.get("path", "")
+        fid = path_to_id.get(path)
+        msg = entry.get("message", "boundary violation")
+        issues.append((
+            proj_id, fid, None, "dead-code", "boundary_violation",
+            "error", 0, 0, None, None, None, None, None,
+            msg, "[]", now, version
+        ))
+        count += 1
+
+    return count
+
+
+def _ingest_health(data: dict, proj_id: int, path_to_id: dict,
+                    now: int, version: str, issues: list) -> int:
+    """Ingest fallow health JSON into the issues list. Returns count."""
+    count = 0
+    for finding in data.get("findings", []):
+        path = finding.get("path", "")
+        fid = path_to_id.get(path)
+        severity = finding.get("severity", "warning")
+        symbol_name = finding.get("name")
+        line = finding.get("line", 0)
+        col = finding.get("col", 0)
+
+        # Determine sub_kind from what was exceeded
+        exceeded = finding.get("exceeded", "")
+        if exceeded == "cyclomatic" or finding.get("cyclomatic"):
+            sub_kind = "high_cyclomatic"
+        elif exceeded == "cognitive" or finding.get("cognitive"):
+            sub_kind = "high_cognitive"
+        elif exceeded == "line_count" or finding.get("line_count"):
+            sub_kind = "large_function"
+        elif exceeded == "param_count":
+            sub_kind = "too_many_params"
+        elif exceeded == "all":
+            sub_kind = "high_complexity"
+        else:
+            sub_kind = "complexity"
+
+        # Build message
+        cyclo = finding.get("cyclomatic")
+        cog = finding.get("cognitive")
+        lines = finding.get("line_count")
+        params = finding.get("param_count")
+        crap = finding.get("crap")
+
+        parts = []
+        if cyclo:
+            parts.append(f"CC={cyclo}")
+        if cog:
+            parts.append(f"cognitive={cog}")
+        if lines:
+            parts.append(f"{lines} lines")
+        if params:
+            parts.append(f"{params} params")
+        if crap:
+            parts.append(f"CRAP={crap:.0f}")
+        msg = f"{symbol_name or '?'} in {path}: {', '.join(parts)}"
+
+        actions = json.dumps(finding.get("actions", []))
+        issues.append((
+            proj_id, fid, symbol_name, "health", sub_kind,
+            severity, line, col, cyclo, cog, lines, params, crap,
+            msg, actions, now, version
+        ))
+        count += 1
+
+    return count
+
+
+def _ingest_dupes(data: dict, proj_id: int, path_to_id: dict,
+                   now: int, version: str, issues: list) -> int:
+    """Ingest fallow dupes JSON into the issues list. Returns count."""
+    count = 0
+    for group in data.get("duplications", []):
+        paths = []
+        for dup in group.get("files", []):
+            p = dup.get("path", "")
+            paths.append(p)
+            fid = path_to_id.get(p)
+            start_line = dup.get("start_line", 0)
+            end_line = dup.get("end_line", 0)
+            msg = f"Duplication ({end_line - start_line} lines): " + ", ".join(paths)
+            issues.append((
+                proj_id, fid, None, "dupes", "duplicate_block",
+                "warning", start_line, 0, None, None,
+                end_line - start_line, None, None,
+                msg, "[]", now, version
+            ))
+            count += 1
+    return count
+
+
+def issues_list(project: str, kind: str = None, severity: str = None,
+                limit: int = 50):
+    """Query ingested Fallow issues."""
+    init_schema()
+    db = get_db()
+    cur = db.cursor()
+
+    cur.execute("SELECT id FROM projects WHERE name = ?", (project,))
+    row = cur.fetchone()
+    if not row:
+        print(f"Project '{project}' not indexed.")
+        db.close()
+        return
+    proj_id = row[0]
+
+    where = ["fi.project_id = ?"]
+    params: list = [proj_id]
+
+    if kind:
+        kinds = [k.strip() for k in kind.split(",")]
+        placeholders = ",".join("?" for _ in kinds)
+        where.append(f"fi.issue_kind IN ({placeholders})")
+        params.extend(kinds)
+
+    if severity:
+        where.append("fi.severity = ?")
+        params.append(severity)
+
+    where_clause = " AND ".join(where)
+
+    rows = cur.execute(f"""
+        SELECT fi.issue_kind, fi.sub_kind, fi.severity,
+               COALESCE(fi.symbol_name, '-') as symbol,
+               COALESCE(f.path, '-') as file_path,
+               fi.line, fi.message
+        FROM fallow_issues fi
+        LEFT JOIN files f ON fi.file_id = f.id
+        WHERE {where_clause}
+        ORDER BY
+            CASE fi.severity
+                WHEN 'critical' THEN 0 WHEN 'error' THEN 1
+                WHEN 'warning' THEN 2 ELSE 3
+            END,
+            fi.issue_kind, fi.line
+        LIMIT ?
+    """, [*params, limit]).fetchall()
+
+    if not rows:
+        print(f"\n  No Fallow issues found for {project}.")
+        print(f"  Run: glyph fallow {project}  to run analysis first.")
+        db.close()
+        return
+
+    # Summary counts — use table name directly (no fi alias from main query)
+    count_where = ["project_id = ?"]
+    count_params: list = [proj_id]
+    if kind:
+        kinds = [k.strip() for k in kind.split(",")]
+        placeholders = ",".join("?" for _ in kinds)
+        count_where.append(f"issue_kind IN ({placeholders})")
+        count_params.extend(kinds)
+    if severity:
+        count_where.append("severity = ?")
+        count_params.append(severity)
+
+    counts = cur.execute(f"""
+        SELECT issue_kind, sub_kind, COUNT(*)
+        FROM fallow_issues WHERE {' AND '.join(count_where)}
+        GROUP BY issue_kind, sub_kind
+        ORDER BY issue_kind, COUNT(*) DESC
+    """, count_params).fetchall()
+
+    print(f"\n  Fallow Issues — {project}")
+    print(f"  {'─'*70}")
+    print(f"  Summary:")
+    for ik, sk, cnt in counts:
+        print(f"    {ik}/{sk}: {cnt}")
+    print()
+
+    print(f"  {'Kind':<16} {'Sub-kind':<22} {'Sev':<10} {'Symbol':<25} {'Location'}")
+    print(f"  {'─'*16} {'─'*22} {'─'*10} {'─'*25} {'─'*50}")
+    for ik, sk, sev, sym, fpath, line, msg in rows:
+        loc = f"{fpath}:{line}" if fpath != "-" else "-"
+        print(f"  {ik:<16} {sk or '-':<22} {sev:<10} {sym:<25} {loc}")
+
+    db.close()
+
+
+def health_report(project: str):
+    """Combined quality + structure health report.
+
+    Merges Glyph's structural data (god nodes, bridges, orphans, file sizes)
+    with Fallow's quality data (complexity, dead code, dupes).
+    """
+    init_schema()
+    db = get_db()
+    cur = db.cursor()
+
+    cur.execute("SELECT id, path FROM projects WHERE name = ?", (project,))
+    row = cur.fetchone()
+    if not row:
+        print(f"Project '{project}' not indexed.")
+        db.close()
+        return
+    proj_id, proj_path = row
+
+    has_fallow = cur.execute(
+        "SELECT COUNT(*) FROM fallow_issues WHERE project_id = ?", (proj_id,)
+    ).fetchone()[0] > 0
+
+    now = int(time.time())
+
+    print(f"\n  ╔══════════════════════════════════════════════════════╗")
+    print(f"  ║  glyph + fallow  —  codebase health report          ║")
+    print(f"  ╠══════════════════════════════════════════════════════╣")
+    print(f"  ║  {project:<48s} ║".format(project))
+    print(f"  ╚══════════════════════════════════════════════════════╝")
+
+    if not has_fallow:
+        print(f"\n  ⚠ No Fallow data ingested yet.")
+        print(f"    Run: glyph fallow {project}")
+        print(f"    Then re-run: glyph health {project}\n")
+    else:
+        # Fallow issue counts
+        issue_counts = cur.execute("""
+            SELECT issue_kind, sub_kind, severity, COUNT(*)
+            FROM fallow_issues WHERE project_id = ?
+            GROUP BY issue_kind, sub_kind, severity
+            ORDER BY issue_kind, COUNT(*) DESC
+        """, (proj_id,)).fetchall()
+
+        print(f"\n  ▸ Fallow Issue Summary")
+        print(f"  {'─'*55}")
+        curr_kind = None
+        for ik, sk, sev, cnt in issue_counts:
+            if ik != curr_kind:
+                if curr_kind:
+                    print()
+                print(f"  [{ik}]")
+                curr_kind = ik
+            print(f"    {sk:<25s} {sev:<10s} {cnt:>4d}")
+
+    # Structural health from Glyph
+    print(f"\n  ▸ Structural Health (Glyph)")
+    print(f"  {'─'*55}")
+
+    # File size extremes
+    big_files = cur.execute("""
+        SELECT f.path, fm.line_count, fm.symbol_count
+        FROM file_metrics fm
+        JOIN files f ON fm.file_id = f.id
+        WHERE fm.project_id = ?
+        ORDER BY fm.line_count DESC LIMIT 10
+    """, (proj_id,)).fetchall()
+
+    print(f"\n  Largest files (by line count):")
+    print(f"  {'File':<50s} {'Lines':>6s}  {'Symbols':>7s}")
+    print(f"  {'─'*50} {'─'*6}  {'─'*7}")
+    for path, lc, sc in big_files:
+        print(f"  {path:<50s} {lc:>6d}  {sc:>7d}")
+
+    # Complex symbols (from Fallow health data)
+    if has_fallow:
+        complex_syms = cur.execute("""
+            SELECT fi.symbol_name, COALESCE(f.path, '?'), fi.line,
+                   fi.cyclomatic, fi.cognitive, fi.crap_score
+            FROM fallow_issues fi
+            LEFT JOIN files f ON fi.file_id = f.id
+            WHERE fi.project_id = ? AND fi.issue_kind = 'health'
+              AND fi.cyclomatic IS NOT NULL
+            ORDER BY fi.cyclomatic DESC LIMIT 15
+        """, (proj_id,)).fetchall()
+
+        if complex_syms:
+            print(f"\n  Most complex functions (cyclomatic):")
+            print(f"  {'Symbol':<30s} {'File':<40s} {'CC':>4s} {'Cog':>4s} {'CRAP':>6s}")
+            print(f"  {'─'*30} {'─'*40} {'─'*4} {'─'*4} {'─'*6}")
+            for name, fpath, line, cc, cog, crap in complex_syms:
+                loc = f"{fpath}:{line}" if fpath else "?"
+                print(f"  {name or '?':<30s} {loc:<40s} {cc or 0:>4d} {cog or 0:>4d} {crap or 0:>6.0f}")
+
+    # God nodes (most-connected symbols)
+    gods = cur.execute("""
+        SELECT s.name, s.kind,
+               (SELECT COUNT(*) FROM edges e
+                WHERE e.target_id = s.id AND e.project_id = ?) as edge_count
+        FROM symbols s
+        WHERE s.project_id = ?
+        ORDER BY edge_count DESC LIMIT 10
+    """, (proj_id, proj_id)).fetchall()
+
+    print(f"\n  Most-connected symbols (change impact):")
+    print(f"  {'Symbol':<30s} {'Kind':<12s} {'Edges':>6s}")
+    print(f"  {'─'*30} {'─'*12} {'─'*6}")
+    for name, kind, cnt in gods:
+        print(f"  {name:<30s} {kind:<12s} {cnt:>6d}")
+
+    # Unused exports (from Glyph, not Fallow)
+    orphans = cur.execute("""
+        SELECT s.name, s.kind, f.path, s.line
+        FROM symbols s
+        JOIN files f ON s.file_id = f.id
+        WHERE s.project_id = ? AND s.exported = 1
+        AND s.id NOT IN (SELECT target_id FROM edges WHERE project_id = ?)
+        AND s.id NOT IN (SELECT source_id FROM edges WHERE project_id = ? AND kind = 'import')
+        ORDER BY s.name LIMIT 15
+    """, (proj_id, proj_id, proj_id)).fetchall()
+
+    if orphans:
+        print(f"\n  Potentially unused exports (Glyph orphans):")
+        for name, kind, fpath, line in orphans:
+            print(f"    {name} ({kind}) → {fpath}:{line}")
+
+    # Stats footer
+    fc = cur.execute("SELECT COUNT(*) FROM files WHERE project_id=?", (proj_id,)).fetchone()[0]
+    sc = cur.execute("SELECT COUNT(*) FROM symbols WHERE project_id=?", (proj_id,)).fetchone()[0]
+    last = cur.execute("SELECT last_scan FROM projects WHERE id=?", (proj_id,)).fetchone()[0]
+    when = datetime.fromtimestamp(last).strftime('%Y-%m-%d %H:%M') if last else 'never'
+
+    print(f"\n  ─────────────────────────────────────────────────────")
+    print(f"  {fc} files · {sc} symbols · indexed {when}")
+    if has_fallow:
+        total_issues = cur.execute(
+            "SELECT COUNT(*) FROM fallow_issues WHERE project_id=?", (proj_id,)
+        ).fetchone()[0]
+        last_fallow = cur.execute(
+            "SELECT MAX(ingested_at) FROM fallow_issues WHERE project_id=?", (proj_id,)
+        ).fetchone()[0]
+        fwhen = datetime.fromtimestamp(last_fallow).strftime('%Y-%m-%d %H:%M') if last_fallow else 'never'
+        print(f"  Fallow: {total_issues} issues · last run {fwhen}")
+    print()
+
+    db.close()
+
+
 def usage():
     print(f"""glyph v{VERSION} — fast incremental codebase knowledge graph
 
@@ -1301,6 +1868,12 @@ def usage():
   glyph map <project>                 Generate PROJECT_MAP.md
   glyph list                          List indexed projects
   glyph watch <name> [interval]       Poll for changes
+
+  ── v1.2 quality (fallow integration) ──
+  glyph fallow <project> [kinds]      Run fallow + ingest (dead-code,health,dupes,all)
+  glyph issues <project> [--kind K] [--sev S] [--limit N]
+                                      Query ingested quality issues
+  glyph health <project>              Combined structural + quality report
 
   ── v1.1 knowledge extensions ──
   glyph history <project>             Backfill git change history
@@ -1379,6 +1952,45 @@ def main():
         n = int(sys.argv[3]) if len(sys.argv) > 3 else 50
         print(f"Run: python3 ~/.glyph/glyph-extend.py --backfill-sessions --project {sys.argv[2]}")
         print(f"(session backfill reads state.db — use glyph-extend.py for now)")
+
+    # ── v1.2 fallow integration ──
+    elif cmd == "fallow":
+        if len(sys.argv) < 3:
+            print("Usage: glyph fallow <project> [kinds]")
+            print("  kinds: dead-code,health,dupes (comma-separated) or 'all' (default)")
+            return
+        kinds = sys.argv[3] if len(sys.argv) > 3 else "all"
+        fallow_ingest(sys.argv[2], kinds)
+
+    elif cmd == "issues":
+        if len(sys.argv) < 3:
+            print("Usage: glyph issues <project> [--kind K] [--sev S] [--limit N]")
+            return
+        project = sys.argv[2]
+        kind = None
+        sev = None
+        limit = 50
+        args = sys.argv[3:]
+        i = 0
+        while i < len(args):
+            if args[i] == "--kind" and i + 1 < len(args):
+                kind = args[i + 1]
+                i += 2
+            elif args[i] == "--sev" and i + 1 < len(args):
+                sev = args[i + 1]
+                i += 2
+            elif args[i] == "--limit" and i + 1 < len(args):
+                limit = int(args[i + 1])
+                i += 2
+            else:
+                i += 1
+        issues_list(project, kind=kind, severity=sev, limit=limit)
+
+    elif cmd == "health":
+        if len(sys.argv) < 3:
+            print("Usage: glyph health <project>")
+            return
+        health_report(sys.argv[2])
 
     elif cmd in ("--version", "-v", "version"):
         print(f"glyph v{VERSION}")
