@@ -10,10 +10,14 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 import time
 from collections import Counter, defaultdict
+from datetime import datetime
 from pathlib import Path
+
+VERSION = "1.1.0"
 
 from tree_sitter import Language, Parser, Node
 
@@ -140,6 +144,60 @@ def init_schema():
     CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(source_id);
     CREATE INDEX IF NOT EXISTS idx_edges_tgt ON edges(target_id);
     CREATE INDEX IF NOT EXISTS idx_files_project ON files(project_id);
+
+    -- v1.1: Knowledge graph extensions
+    CREATE TABLE IF NOT EXISTS file_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        file_id INTEGER NOT NULL,
+        project_id INTEGER NOT NULL,
+        old_hash TEXT,
+        new_hash TEXT NOT NULL,
+        commit_hash TEXT NOT NULL,
+        commit_msg TEXT,
+        author TEXT,
+        committed_at INTEGER NOT NULL,
+        change_type TEXT,
+        lines_added INTEGER,
+        lines_removed INTEGER,
+        summary TEXT,
+        FOREIGN KEY (file_id) REFERENCES files(id),
+        FOREIGN KEY (project_id) REFERENCES projects(id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_file_history_file
+        ON file_history(file_id, committed_at);
+
+    CREATE TABLE IF NOT EXISTS descriptions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        target_type TEXT NOT NULL,
+        target_id INTEGER NOT NULL,
+        project_id INTEGER NOT NULL,
+        description TEXT NOT NULL,
+        detail TEXT,
+        generated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+        model TEXT,
+        source_session_id TEXT,
+        confidence REAL DEFAULT 1.0,
+        version_hash TEXT,
+        FOREIGN KEY (project_id) REFERENCES projects(id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_descriptions_target
+        ON descriptions(target_type, target_id);
+
+    CREATE TABLE IF NOT EXISTS session_refs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL,
+        project_id INTEGER NOT NULL,
+        file_id INTEGER,
+        symbol_id INTEGER,
+        ref_type TEXT NOT NULL,
+        summary TEXT,
+        message_count INTEGER,
+        first_at REAL,
+        last_at REAL,
+        FOREIGN KEY (project_id) REFERENCES projects(id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_session_refs_file ON session_refs(file_id);
+    CREATE INDEX IF NOT EXISTS idx_session_refs_symbol ON session_refs(symbol_id);
     """)
     db.commit()
     db.close()
@@ -501,21 +559,33 @@ def scan_project(name: str, root: str, full: bool = False):
     current_paths = {rel for rel, _, _, _, _ in to_parse}
     # Also keep existing files that are still on disk
     for rel in existing:
-        if rel in {r for r, _, _, _, _ in files_found}:
+        if rel in {r for r, _, _, _ in files_found}:
             current_paths.add(rel)
 
-    # Remove files no longer on disk
+    # Remove stale files — clean edges/symbols first to avoid FK violations
     placeholders = ",".join("?" for _ in current_paths)
-    cur.execute(f"""DELETE FROM files WHERE project_id = ? AND path NOT IN ({placeholders})""",
-                [project_id, *current_paths])
-    # Also clean orphaned symbols/edges
-    cur.execute("""DELETE FROM edges WHERE source_id IN
-        (SELECT s.id FROM symbols s LEFT JOIN files f ON s.file_id = f.id
-         WHERE f.id IS NULL AND s.project_id=?)""", (project_id,))
-    cur.execute("""DELETE FROM symbols WHERE file_id IN
-        (SELECT id FROM files WHERE project_id=? AND path NOT IN ({placeholders}))
-    """.format(placeholders=",".join("?" for _ in current_paths)),
-        [project_id, *current_paths])
+    if not current_paths:
+        # No files found — wipe everything for this project
+        cur.execute("DELETE FROM edges WHERE project_id = ?", (project_id,))
+        cur.execute("DELETE FROM symbols WHERE project_id = ?", (project_id,))
+        cur.execute("DELETE FROM files WHERE project_id = ?", (project_id,))
+    else:
+        # Delete edges referencing symbols in stale files (target_id FK)
+        cur.execute(f"""DELETE FROM edges WHERE target_id IN
+            (SELECT s.id FROM symbols s JOIN files f ON s.file_id = f.id
+             WHERE f.project_id = ? AND f.path NOT IN ({placeholders}))
+        """, [project_id, *current_paths])
+        # Delete edges where source is in stale files
+        cur.execute(f"""DELETE FROM edges WHERE source_id IN
+            (SELECT s.id FROM symbols s JOIN files f ON s.file_id = f.id
+             WHERE f.project_id = ? AND f.path NOT IN ({placeholders}))
+        """, [project_id, *current_paths])
+        # Now delete symbols, then files
+        cur.execute(f"""DELETE FROM symbols WHERE file_id IN
+            (SELECT id FROM files WHERE project_id = ? AND path NOT IN ({placeholders}))
+        """, [project_id, *current_paths])
+        cur.execute(f"""DELETE FROM files WHERE project_id = ? AND path NOT IN ({placeholders})""",
+                    [project_id, *current_paths])
 
     # Parse files
     all_symbols = []
@@ -543,7 +613,9 @@ def scan_project(name: str, root: str, full: bool = False):
                    (project_id, rel))
         file_id = cur.fetchone()[0]
 
-        # Remove old symbols/edges for this file
+        # Remove old symbols/edges for this file (both source and target FKs)
+        cur.execute("""DELETE FROM edges WHERE target_id IN
+            (SELECT id FROM symbols WHERE file_id=?)""", (file_id,))
         cur.execute("""DELETE FROM edges WHERE source_id IN
             (SELECT id FROM symbols WHERE file_id=?)""", (file_id,))
         cur.execute("DELETE FROM symbols WHERE file_id=?", (file_id,))
@@ -1084,8 +1156,138 @@ def generate_map(project: str):
 # CLI
 # ═══════════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════════
+# v1.1 — KNOWLEDGE GRAPH EXTENSIONS
+# ═══════════════════════════════════════════════════════════════════
+
+def history_project(name: str):
+    """Backfill git change history for a project into file_history table."""
+    init_schema()
+    db = get_db()
+    cur = db.cursor()
+    cur.execute("SELECT id, path FROM projects WHERE name = ?", (name,))
+    row = cur.fetchone()
+    if not row:
+        print(f"Project '{name}' not found. Run 'glyph scan {name} <path>' first.")
+        db.close()
+        return
+    proj_id, proj_path = row[0], row[1]
+
+    # Build file path → id mapping
+    files = cur.execute(
+        "SELECT id, path FROM files WHERE project_id = ?", (proj_id,)
+    ).fetchall()
+    path_to_id = {f[1]: f[0] for f in files}
+
+    # Clear existing
+    deleted = cur.execute(
+        "DELETE FROM file_history WHERE project_id = ?", (proj_id,)
+    ).rowcount
+
+    # Run git log
+    try:
+        result = subprocess.run(
+            ['git', '-C', proj_path, 'log',
+             '--format=%H%x00%at%x00%an%x00%s',
+             '--name-status', '--diff-filter=AMDR'],
+            capture_output=True, text=True, timeout=60
+        )
+    except subprocess.TimeoutExpired:
+        print("Git log timed out")
+        db.close()
+        return
+
+    if result.returncode != 0:
+        print(f"Git error: {result.stderr[:200]}")
+        db.close()
+        return
+
+    inserted = 0
+    skipped = 0
+    current = None
+
+    for line in result.stdout.strip().split('\n'):
+        if not line.strip():
+            continue
+        if '\x00' in line and '\t' not in line:
+            parts = line.split('\x00', 3)
+            if len(parts) >= 4:
+                current = {'hash': parts[0], 'ts': int(parts[1]),
+                           'author': parts[2], 'msg': parts[3][:500]}
+            continue
+        if '\t' in line and current:
+            status = line[0]
+            filepath = line.split('\t')[-1]
+            if filepath not in path_to_id:
+                skipped += 1
+                continue
+            change_type = {'A': 'added', 'M': 'modified',
+                           'D': 'deleted', 'R': 'renamed'}.get(status, 'modified')
+            cur.execute("""
+                INSERT INTO file_history
+                (file_id, project_id, commit_hash, commit_msg, author,
+                 committed_at, change_type, old_hash, new_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?, '', '')
+            """, (path_to_id[filepath], proj_id, current['hash'],
+                  current['msg'], current['author'], current['ts'], change_type))
+            inserted += 1
+
+    db.commit()
+    print(f"History backfill: {inserted} entries ({skipped} files outside index, "
+          f"{deleted} old entries cleared)")
+    db.close()
+
+
+def stats_extended(project: str = None):
+    """Enhanced stats including history and session refs."""
+    init_schema()
+    db = get_db()
+    cur = db.cursor()
+
+    if project:
+        cur.execute("SELECT id FROM projects WHERE name = ?", (project,))
+        if not cur.fetchone():
+            print(f"Project '{project}' not found")
+            db.close()
+            return
+        proj_filter = "WHERE p.name = ?"
+        params = (project,)
+    else:
+        proj_filter = ""
+        params = ()
+
+    print(f"\n  glyph v{VERSION} — knowledge graph")
+    print(f"  {'─'*45}")
+
+    rows = cur.execute(f"""
+        SELECT p.name, p.last_scan,
+               (SELECT COUNT(*) FROM files f WHERE f.project_id = p.id) as files,
+               (SELECT COUNT(*) FROM symbols s WHERE s.project_id = p.id) as symbols,
+               (SELECT COUNT(*) FROM edges e WHERE e.project_id = p.id) as edges,
+               (SELECT COUNT(*) FROM file_history fh WHERE fh.project_id = p.id) as history,
+               (SELECT COUNT(*) FROM session_refs sr WHERE sr.project_id = p.id) as refs,
+               (SELECT COUNT(*) FROM descriptions d WHERE d.project_id = p.id) as descs
+        FROM projects p {proj_filter}
+        ORDER BY p.last_scan DESC
+    """, params).fetchall()
+
+    for r in rows:
+        name, ts, nf, ns, ne, nh, nr, nd = r
+        when = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M') if ts else 'never'
+        print(f"\n  {name}")
+        print(f"    Scanned:     {when}")
+        print(f"    Structure:   {nf} files, {ns} symbols, {ne} edges")
+        print(f"    History:     {nh} git changes")
+        print(f"    Context:     {nr} session refs, {nd} descriptions")
+
+    if not project:
+        db_size = os.path.getsize(os.path.expanduser('~/.glyph/glyph.db'))
+        print(f"\n  DB: {db_size/1024/1024:.1f} MB")
+    db.close()
+
+
 def usage():
-    print("""glyph — fast incremental codebase knowledge graph
+    print(f"""glyph v{VERSION} — fast incremental codebase knowledge graph
 
   glyph scan <name> <path>            Index a project
   glyph scan <name> <path> --full     Full re-index (ignore cache)
@@ -1095,10 +1297,14 @@ def usage():
   glyph godnodes <project> [N]        Most-connected symbols
   glyph bridges <project> [N]         Cross-file connectors
   glyph orphans <project> [N]         Unused exported symbols
-  glyph stats [project]               Indexing statistics
+  glyph stats [project]               Indexing statistics (extended)
   glyph map <project>                 Generate PROJECT_MAP.md
   glyph list                          List indexed projects
   glyph watch <name> [interval]       Poll for changes
+
+  ── v1.1 knowledge extensions ──
+  glyph history <project>             Backfill git change history
+  glyph refs <project> [N]            Backfill session cross-references
 """)
 
 
@@ -1158,7 +1364,24 @@ def main():
 
     elif cmd == "stats":
         project = sys.argv[2] if len(sys.argv) > 2 else None
-        stats(project)
+        stats_extended(project)
+
+    elif cmd == "history":
+        if len(sys.argv) < 3:
+            print("Usage: glyph history <project>")
+            return
+        history_project(sys.argv[2])
+
+    elif cmd == "refs":
+        if len(sys.argv) < 3:
+            print("Usage: glyph refs <project> [N]")
+            return
+        n = int(sys.argv[3]) if len(sys.argv) > 3 else 50
+        print(f"Run: python3 ~/.glyph/glyph-extend.py --backfill-sessions --project {sys.argv[2]}")
+        print(f"(session backfill reads state.db — use glyph-extend.py for now)")
+
+    elif cmd in ("--version", "-v", "version"):
+        print(f"glyph v{VERSION}")
 
     elif cmd == "map":
         if len(sys.argv) < 3:
