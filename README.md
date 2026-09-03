@@ -1,3 +1,20 @@
+> ## 📦 This repository has moved
+>
+> **Glyph is now developed at [github.com/Daigtas/glyph](https://github.com/Daigtas/glyph).**
+>
+> The code here is **v1.2.0 and should not be used** — v2.0.0 fixed three defects that
+> made most of v1's knowledge graph non-functional (46% of symbol names were corrupt,
+> graph traversal returned nothing, and the index lost ~35% of its edges every ten
+> file edits).
+>
+> ```bash
+> git clone https://github.com/Daigtas/glyph.git
+> ```
+>
+> → [Latest release](https://github.com/Daigtas/glyph/releases/latest) · [Changelog](https://github.com/Daigtas/glyph/blob/main/CHANGES.md)
+
+---
+
 # 𐂷 Glyph
 
 > **Carve meaning into your codebase.**
